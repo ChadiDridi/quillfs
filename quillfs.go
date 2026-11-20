@@ -157,13 +157,17 @@ func (fsys *FS) Close() error {
 	fsys.syncMu.Lock()
 	defer fsys.syncMu.Unlock()
 	fsys.mu.Lock()
-	defer fsys.mu.Unlock()
 	if fsys.closed {
+		fsys.mu.Unlock()
 		return fs.ErrClosed
 	}
-	err := fsys.checkpoint()
-	fsys.closed = true
+	fsys.closed = true // nothing more gets in; the snapshot is the final state
+	snap := fsys.snapshot()
+	fsys.mu.Unlock()
+	err := fsys.commit(snap)
+	fsys.mu.Lock()
 	fsys.closeFiles()
+	fsys.mu.Unlock()
 	return err
 }
 

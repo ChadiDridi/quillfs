@@ -1,7 +1,6 @@
 package quillfs
 
 import (
-	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -201,44 +200,41 @@ func (fsys *FS) replay(seg *segment, typ byte, meta, data []byte, dataPos uint32
 	return nil
 }
 
-// checkpoint writes the whole tree to disk, so that the next Open starts
-// from it and replays only what was logged afterwards. It then deletes the
-// segments that hold nothing live any more. The caller holds syncMu and mu.
-func (fsys *FS) checkpoint() error {
-	pos := logPos{fsys.head.seq, fsys.head.tail}
-	// The checkpoint points into the log. Everything it points to must be on
-	// disk before the checkpoint is.
-	var dirty []*segment
-	for seq := fsys.synced.seq; seq <= pos.seq; seq++ {
+// A checkpoint is the whole tree written to disk, so that the next Open
+// starts from it and replays only what was logged afterwards. It is made in
+// two steps, so that writers wait only for the first:
+//
+//	snapshot  serializes the tree in memory, under the lock
+//	commit    flushes the log and writes the file, without the lock
+type snapshot struct {
+	pos   logPos     // the log position the tree corresponds to
+	image []byte     // the checkpoint file
+	dirty []*segment // segments to flush before the file may exist
+	dead  []uint32   // segments nothing in the image points to
+}
+
+// snapshot serializes the tree. The caller holds syncMu and mu.
+func (fsys *FS) snapshot() *snapshot {
+	snap := &snapshot{pos: logPos{fsys.head.seq, fsys.head.tail}}
+	for seq := fsys.synced.seq; seq <= snap.pos.seq; seq++ {
 		if s := fsys.segs[seq]; s != nil {
-			dirty = append(dirty, s)
+			snap.dirty = append(snap.dirty, s)
 		}
 	}
-	if err := fsys.flush(dirty, pos); err != nil {
-		return err
+	// A segment before the snapshot is needed only for the file data in it.
+	// Which ones are empty has to be decided now: a segment that empties
+	// later is still pointed to by this image.
+	for seq, seg := range fsys.segs {
+		if seq < snap.pos.seq && seg.live == 0 {
+			snap.dead = append(snap.dead, seq)
+		}
 	}
-
-	tmp := filepath.Join(fsys.dir, checkpointName+".tmp")
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp)
-	w := bufio.NewWriterSize(f, 1<<20)
-	sum := crc32.New(castagnoli)
-	var buf []byte
-	emit := func() {
-		w.Write(buf)
-		sum.Write(buf)
-		buf = buf[:0]
-	}
-	buf = append(buf, checkpointMagic...)
+	buf := append(make([]byte, 0, 64+96*len(fsys.inodes)), checkpointMagic...)
 	buf = putU64(buf, uint64(fsys.segSize))
 	buf = putU64(buf, fsys.nextIno)
-	buf = putU32(buf, pos.seq)
-	buf = putU64(buf, uint64(pos.off))
+	buf = putU32(buf, snap.pos.seq)
+	buf = putU64(buf, uint64(snap.pos.off))
 	buf = putU64(buf, uint64(fsys.root.mtime))
-	emit()
 	// Parents before children, so that loading can attach each inode as it
 	// is read.
 	var dump func(in *inode)
@@ -258,15 +254,31 @@ func (fsys *FS) checkpoint() error {
 				buf = putU32(buf, e.pos)
 				buf = putU32(buf, e.n)
 			}
-			emit()
 			dump(child)
 		}
 	}
 	dump(fsys.root)
 	buf = append(buf, 0)
-	emit()
-	w.Write(binary.LittleEndian.AppendUint32(nil, sum.Sum32()))
-	if err := w.Flush(); err != nil {
+	snap.image = binary.LittleEndian.AppendUint32(buf, crc32.Checksum(buf, castagnoli))
+	return snap
+}
+
+// commit makes a snapshot the volume's checkpoint. The caller holds syncMu
+// but not mu: operations go on meanwhile, and land in the log after the
+// snapshot's position, where the next Open will find them.
+func (fsys *FS) commit(snap *snapshot) error {
+	// The image points into the log. Everything it points to must be on disk
+	// before the image is.
+	if err := fsys.flush(snap.dirty, snap.pos); err != nil {
+		return err
+	}
+	tmp := filepath.Join(fsys.dir, checkpointName+".tmp")
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+	if _, err := f.Write(snap.image); err != nil {
 		f.Close()
 		return err
 	}
@@ -280,20 +292,19 @@ func (fsys *FS) checkpoint() error {
 	if err := os.Rename(tmp, filepath.Join(fsys.dir, checkpointName)); err != nil {
 		return err
 	}
-	if err := syncDir(fsys.dir); err != nil {
-		return err
-	}
+	return syncDir(fsys.dir)
+}
 
-	// Segments before the checkpoint are needed only for the file data they
-	// hold. Once that is all dead, the file can go.
-	for seq, seg := range fsys.segs {
-		if seq < pos.seq && seg.live == 0 {
+// drop deletes the segments a committed snapshot found empty. The caller
+// holds syncMu and mu.
+func (fsys *FS) drop(snap *snapshot) {
+	for _, seq := range snap.dead {
+		if seg := fsys.segs[seq]; seg != nil {
 			seg.close()
 			os.Remove(seg.path)
 			delete(fsys.segs, seq)
 		}
 	}
-	return nil
 }
 
 func syncDir(dir string) error {
@@ -369,23 +380,33 @@ func (fsys *FS) Checkpoint() error {
 	fsys.syncMu.Lock()
 	defer fsys.syncMu.Unlock()
 	fsys.mu.Lock()
-	defer fsys.mu.Unlock()
 	if fsys.closed {
+		fsys.mu.Unlock()
 		return fs.ErrClosed
 	}
-	return fsys.checkpoint()
+	snap := fsys.snapshot()
+	fsys.mu.Unlock()
+	if err := fsys.commit(snap); err != nil {
+		return err
+	}
+	fsys.mu.Lock()
+	fsys.drop(snap)
+	fsys.mu.Unlock()
+	return nil
 }
 
 // Compact gives disk space back. Segments in which less than half of the
 // bytes are still live have their live data copied to the head of the log;
 // a checkpoint then makes every emptied segment deletable. It returns the
-// number of segment files removed.
+// number of segment files removed. Unless Options.NoAutoCompact is set, a
+// background goroutine calls it when more than half of the volume is
+// garbage.
 func (fsys *FS) Compact() (removed int, err error) {
 	fsys.syncMu.Lock()
 	defer fsys.syncMu.Unlock()
 	fsys.mu.Lock()
-	defer fsys.mu.Unlock()
 	if fsys.closed {
+		fsys.mu.Unlock()
 		return 0, fs.ErrClosed
 	}
 	victims := map[uint32]bool{}
@@ -407,6 +428,7 @@ func (fsys *FS) Compact() (removed int, err error) {
 			fsys.scratch = m
 			seg, pos, err := fsys.append(recReloc, m, old.mem[e.pos:e.pos+e.n])
 			if err != nil {
+				fsys.mu.Unlock()
 				return 0, err
 			}
 			old.live -= int64(e.n)
@@ -414,9 +436,15 @@ func (fsys *FS) Compact() (removed int, err error) {
 			e.seg, e.pos = seg.seq, pos
 		}
 	}
-	before := len(fsys.segs)
-	if err := fsys.checkpoint(); err != nil {
+	snap := fsys.snapshot()
+	fsys.mu.Unlock()
+	if err := fsys.commit(snap); err != nil {
 		return 0, err
 	}
-	return before - len(fsys.segs), nil
+	fsys.mu.Lock()
+	before := len(fsys.segs)
+	fsys.drop(snap)
+	removed = before - len(fsys.segs)
+	fsys.mu.Unlock()
+	return removed, nil
 }
