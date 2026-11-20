@@ -32,6 +32,7 @@ func open(t testing.TB, dir string, segSize int64) *FS {
 // abandon drops a volume the way a killed process does: no checkpoint, no
 // flush, nothing but what is already in the mapped segments.
 func (fsys *FS) abandon() {
+	fsys.stopMaintenance()
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
 	fsys.closed = true
@@ -379,7 +380,11 @@ func TestTornTail(t *testing.T) {
 
 func TestCompactReclaimsSpace(t *testing.T) {
 	dir := t.TempDir()
-	fsys := open(t, dir, 256<<10)
+	// No background compaction: this test wants to see what one call does.
+	fsys, err := Open(dir, &Options{SegmentSize: 256 << 10, NoAutoCompact: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	payload := func(i int) []byte { return bytes.Repeat([]byte{byte(i)}, 10000) }
 	for i := 0; i < 300; i++ {
 		fsys.WriteFile(fmt.Sprintf("f%03d", i), payload(i), 0o644)
@@ -437,6 +442,37 @@ func TestCompactReclaimsSpace(t *testing.T) {
 	re := open(t, dir, 0)
 	defer re.Close()
 	check(re, "after reopening without a clean close")
+}
+
+// TestAutoCompact overwrites the same files many times without ever calling
+// Compact. The background goroutine has to keep the volume from growing with
+// everything that was ever written.
+func TestAutoCompact(t *testing.T) {
+	fsys := open(t, t.TempDir(), 256<<10)
+	defer fsys.Close()
+	const rounds, files, size = 60, 100, 10000
+	for r := 0; r < rounds; r++ {
+		for i := 0; i < files; i++ {
+			if err := fsys.WriteFile(fmt.Sprintf("f%03d", i), bytes.Repeat([]byte{byte(r)}, size), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	written := int64(rounds * files * size)
+	deadline := time.Now().Add(5 * time.Second)
+	for fsys.Usage().Disk > 8*files*size && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	u := fsys.Usage()
+	t.Logf("wrote %d MiB in total, %d MiB are live, the volume takes %d MiB", written>>20, u.Live>>20, u.Disk>>20)
+	if u.Disk > 8*files*size {
+		t.Errorf("the volume takes %d bytes for %d live bytes", u.Disk, u.Live)
+	}
+	for i := 0; i < files; i++ {
+		if data, err := fsys.ReadFile(fmt.Sprintf("f%03d", i)); err != nil || !bytes.Equal(data, bytes.Repeat([]byte{rounds - 1}, size)) {
+			t.Fatalf("f%03d: %d bytes, %v", i, len(data), err)
+		}
+	}
 }
 
 // TestRecoveredTreeIsTheTreeThatWas hammers a volume from several goroutines,

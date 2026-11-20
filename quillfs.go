@@ -27,6 +27,9 @@ type Options struct {
 	// SegmentSize is the size of each log segment file. It is fixed when the
 	// volume is created and defaults to 64 MiB.
 	SegmentSize int64
+	// NoAutoCompact turns off the background goroutine that calls Compact
+	// when more than half of the volume is garbage.
+	NoAutoCompact bool
 }
 
 const (
@@ -51,10 +54,15 @@ type FS struct {
 	inodes   map[uint64]*inode
 	nextIno  uint64
 	scratch  []byte // reused for the meta part of a record
+	hdr      []byte // reused for the header of a record written with pwrite
 	closed   bool
 
 	syncMu sync.Mutex // serializes Sync and Compact
 	synced logPos     // everything before this is on stable storage
+
+	wake chan struct{} // tells the maintenance goroutine to compact
+	stop chan struct{}
+	done sync.WaitGroup
 }
 
 // logPos is a position in the log.
@@ -86,7 +94,53 @@ func Open(dir string, opts *Options) (*FS, error) {
 		fsys.closeFiles()
 		return nil, err
 	}
+	fsys.stop = make(chan struct{})
+	if opts == nil || !opts.NoAutoCompact {
+		fsys.wake = make(chan struct{}, 1)
+		fsys.done.Add(1)
+		go fsys.maintain(fsys.stop, fsys.wake)
+	}
 	return fsys, nil
+}
+
+// maintain compacts the volume whenever a new segment is started while most
+// of the volume is garbage.
+func (fsys *FS) maintain(stop, wake <-chan struct{}) {
+	defer fsys.done.Done()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-wake:
+			fsys.Compact()
+		}
+	}
+}
+
+// garbageHeavy reports whether more than half of a volume of at least four
+// segments is dead. The caller holds mu.
+func (fsys *FS) garbageHeavy() bool {
+	if len(fsys.segs) < 4 {
+		return false
+	}
+	var live int64
+	for _, s := range fsys.segs {
+		live += s.live
+	}
+	return live*2 < int64(len(fsys.segs))*fsys.segSize
+}
+
+// stopMaintenance ends the background goroutine and waits for it. It must be
+// called without holding any lock, since the goroutine may be compacting.
+func (fsys *FS) stopMaintenance() {
+	fsys.mu.Lock()
+	stop := fsys.stop
+	fsys.stop = nil
+	fsys.mu.Unlock()
+	if stop != nil {
+		close(stop)
+		fsys.done.Wait()
+	}
 }
 
 func (fsys *FS) closeFiles() {
@@ -99,6 +153,7 @@ func (fsys *FS) closeFiles() {
 // Close writes a checkpoint, so that the next Open does not have to replay
 // the log, and releases the volume.
 func (fsys *FS) Close() error {
+	fsys.stopMaintenance()
 	fsys.syncMu.Lock()
 	defer fsys.syncMu.Unlock()
 	fsys.mu.Lock()

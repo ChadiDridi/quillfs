@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // The volume is a directory of segment files. Each segment is preallocated,
@@ -95,6 +97,12 @@ func (fsys *FS) newSegment() error {
 	fsys.segs[seq] = seg
 	fsys.head = seg
 	fsys.nextSeq++
+	if fsys.wake != nil && fsys.garbageHeavy() {
+		select {
+		case fsys.wake <- struct{}{}:
+		default: // already asked
+		}
+	}
 	return nil
 }
 
@@ -136,6 +144,24 @@ func (fsys *FS) append(typ byte, meta, data []byte) (*segment, uint32, error) {
 func (fsys *FS) writeRecord(seg *segment, typ byte, meta, data []byte) int64 {
 	pos := seg.tail
 	n := recHeader + len(meta) + len(data)
+	seg.tail = pos + pad8(int64(n))
+	if len(data) >= directWriteMin {
+		// A large payload goes through pwrite: the kernel copies it into the
+		// page cache in one call, where storing through the mapping would
+		// take a page fault for every 4 KiB. It is the same page cache, so
+		// the mapping sees the bytes at once.
+		h := append(fsys.hdr[:0], make([]byte, recHeader)...)
+		h = append(h, meta...)
+		fsys.hdr = h
+		binary.LittleEndian.PutUint32(h[4:], uint32(n))
+		h[8] = typ
+		binary.LittleEndian.PutUint32(h[12:], uint32(len(meta)))
+		binary.LittleEndian.PutUint32(h, crc32.Update(crc32.Checksum(h[4:], castagnoli), castagnoli, data))
+		if _, err := unix.Pwritev(int(seg.f.Fd()), [][]byte{h, data}, pos); err == nil {
+			return pos
+		}
+		// Fall through and store it the other way.
+	}
 	b := seg.mem[pos : pos+int64(n)]
 	binary.LittleEndian.PutUint32(b[4:], uint32(n))
 	b[8], b[9], b[10], b[11] = typ, 0, 0, 0
@@ -145,9 +171,12 @@ func (fsys *FS) writeRecord(seg *segment, typ byte, meta, data []byte) int64 {
 	// The checksum goes in last: until it is there, recovery sees a torn
 	// record and stops in front of it.
 	binary.LittleEndian.PutUint32(b, crc32.Checksum(b[4:], castagnoli))
-	seg.tail = pos + pad8(int64(n))
 	return pos
 }
+
+// directWriteMin is the payload size from which a record is written with
+// pwrite instead of through the mapping.
+var directWriteMin = 64 << 10
 
 // scan calls fn for every record of a segment from offset from. It returns
 // where the valid records end and whether the segment was closed by an end
