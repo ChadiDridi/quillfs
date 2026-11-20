@@ -103,6 +103,7 @@ func (fsys *FS) applyCreate(parent *inode, name string, ino uint64, mode fs.File
 func (fsys *FS) applyWrite(in *inode, off int64, seg *segment, pos, n uint32) {
 	in.setExtent(extent{off, seg.seq, pos, n}, fsys.dead)
 	seg.live += int64(n)
+	seg.data += int64(n)
 	if end := off + int64(n); end > in.size {
 		in.size = end
 	}

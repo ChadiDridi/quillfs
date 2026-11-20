@@ -1,6 +1,7 @@
 package quillfs
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -51,6 +52,9 @@ func (fsys *FS) load(opts *Options) error {
 		return fsys.newSegment()
 	}
 
+	// A segment whose header never reached the disk. That is normal for the
+	// newest ones after a power cut, and corruption anywhere else.
+	blank := map[uint32]bool{}
 	var seqs []uint32
 	for _, name := range names {
 		n, err := strconv.ParseUint(strings.TrimSuffix(filepath.Base(name), ".seg"), 10, 32)
@@ -85,25 +89,39 @@ func (fsys *FS) load(opts *Options) error {
 		}
 		fsys.segs[seq] = seg
 		if string(seg.mem[:8]) != segMagic || binary.LittleEndian.Uint32(seg.mem[8:]) != seq {
-			return corrupt("%s has a bad header", path)
+			blank[seq] = true
 		}
 	}
 	last := seqs[len(seqs)-1]
 	fsys.nextSeq = last + 1
 
 	start := logPos{seqs[0], segHeader}
-	if pos, ok, err := fsys.loadCheckpoint(); err != nil {
+	if pos, ok, err := fsys.loadCheckpoint(blank); err != nil {
 		return err
 	} else if ok {
 		start = pos
 	}
 	fsys.synced = logPos{start.seq, 0}
 
-	for _, seq := range seqs {
+	// Replay the log from the checkpoint on, up to the first place where it
+	// stops making sense. After a kill that place is a record cut short.
+	// After a power cut it can be anything that was not synced: a record with
+	// a page missing, a segment with no end, a file with no contents. In
+	// every case what lies before is the last consistent state, and what lies
+	// after was never promised to anyone, so it is discarded.
+	for i, seq := range seqs {
 		if seq < start.seq {
+			if blank[seq] {
+				return corrupt("%s has a bad header", fsys.segs[seq].path)
+			}
 			continue
 		}
 		seg := fsys.segs[seq]
+		if blank[seq] {
+			// Only reachable for the segment the checkpoint points into,
+			// which was synced before the checkpoint was written.
+			return corrupt("%s has a bad header", seg.path)
+		}
 		from := int64(segHeader)
 		if seq == start.seq {
 			from = start.off
@@ -115,32 +133,33 @@ func (fsys *FS) load(opts *Options) error {
 			return err
 		}
 		seg.tail = end
-		if seq != last {
-			if !closed {
-				return corrupt("the log stops at offset %d of %s, which is not the last segment", end, seg.path)
-			}
-			continue
-		}
 		fsys.head = seg
+		if closed && i+1 < len(seqs) && seqs[i+1] == seq+1 && !blank[seq+1] {
+			continue // the log goes on in the next segment
+		}
+		for _, later := range seqs[i+1:] {
+			fsys.segs[later].close()
+			os.Remove(fsys.segs[later].path)
+			delete(fsys.segs, later)
+		}
+		fsys.nextSeq = seq + 1
 		if closed {
 			return fsys.newSegment()
 		}
-		// What follows the last good record is a write that never finished.
-		// Clear it, so that no part of it can ever be read as a record.
-		if torn := seg.mem[end:min(int64(len(seg.mem)), end+pad8(int64(recHeader+1024+fsys.maxChunk)))]; !allZero(torn) {
-			clear(torn)
+		// Whatever follows the last good record must never be read as a
+		// record: not the write that was cut short, and not older records
+		// that a power cut left behind further on.
+		zero := make([]byte, 64<<10)
+		for rest := seg.mem[end:]; len(rest) > 0; {
+			n := min(len(rest), len(zero))
+			if !bytes.Equal(rest[:n], zero[:n]) {
+				clear(rest[:n])
+			}
+			rest = rest[n:]
 		}
+		return nil
 	}
-	return nil
-}
-
-func allZero(b []byte) bool {
-	for _, c := range b {
-		if c != 0 {
-			return false
-		}
-	}
-	return true
+	return corrupt("the checkpoint points past the end of the log")
 }
 
 func (fsys *FS) setChunk() {
@@ -235,6 +254,11 @@ func (fsys *FS) snapshot() *snapshot {
 	buf = putU32(buf, snap.pos.seq)
 	buf = putU64(buf, uint64(snap.pos.off))
 	buf = putU64(buf, uint64(fsys.root.mtime))
+	buf = putU32(buf, uint32(len(fsys.segs)))
+	for seq, seg := range fsys.segs {
+		buf = putU32(buf, seq)
+		buf = putU64(buf, uint64(seg.data))
+	}
 	// Parents before children, so that loading can attach each inode as it
 	// is read.
 	var dump func(in *inode)
@@ -318,7 +342,7 @@ func syncDir(dir string) error {
 
 // loadCheckpoint rebuilds the tree from the checkpoint file, if there is one,
 // and returns the log position to replay from.
-func (fsys *FS) loadCheckpoint() (logPos, bool, error) {
+func (fsys *FS) loadCheckpoint(blank map[uint32]bool) (logPos, bool, error) {
 	data, err := os.ReadFile(filepath.Join(fsys.dir, checkpointName))
 	if errors.Is(err, fs.ErrNotExist) {
 		return logPos{}, false, nil
@@ -337,6 +361,12 @@ func (fsys *FS) loadCheckpoint() (logPos, bool, error) {
 	fsys.nextIno = d.u64()
 	pos := logPos{d.u32(), int64(d.u64())}
 	fsys.root.mtime = int64(d.u64())
+	for n := d.u32(); n > 0 && !d.bad; n-- {
+		seq, data := d.u32(), int64(d.u64())
+		if seg := fsys.segs[seq]; seg != nil && seq <= pos.seq {
+			seg.data = data
+		}
+	}
 	for {
 		if len(d.b) < 1 {
 			return logPos{}, false, corrupt("the checkpoint ends early")
@@ -361,7 +391,7 @@ func (fsys *FS) loadCheckpoint() (logPos, bool, error) {
 		for i := range in.ext {
 			e := extent{off: int64(d.u64()), seg: d.u32(), pos: d.u32(), n: d.u32()}
 			seg := fsys.segs[e.seg]
-			if d.bad || seg == nil || int64(e.pos)+int64(e.n) > fsys.segSize {
+			if d.bad || seg == nil || blank[e.seg] || int64(e.pos)+int64(e.n) > fsys.segSize {
 				return logPos{}, false, corrupt("the checkpoint points outside the log")
 			}
 			seg.live += int64(e.n)
@@ -411,7 +441,7 @@ func (fsys *FS) Compact() (removed int, err error) {
 	}
 	victims := map[uint32]bool{}
 	for seq, seg := range fsys.segs {
-		if seg != fsys.head && seg.live > 0 && seg.live < fsys.segSize/2 {
+		if seg.live > 0 && fsys.reclaimable(seg) {
 			victims[seq] = true
 		}
 	}
@@ -433,6 +463,8 @@ func (fsys *FS) Compact() (removed int, err error) {
 			}
 			old.live -= int64(e.n)
 			seg.live += int64(e.n)
+			seg.data += int64(e.n)
+			fsys.relocated += int64(e.n)
 			e.seg, e.pos = seg.seq, pos
 		}
 	}

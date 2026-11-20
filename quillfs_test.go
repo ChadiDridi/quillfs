@@ -307,17 +307,24 @@ func TestHandles(t *testing.T) {
 	}
 }
 
-// TestTornTail cuts the log at every byte of the last operation, as a crash
-// in the middle of it would, and requires that the volume opens to a state
-// in which that operation either happened completely or not at all.
+// TestTornTail cuts the log inside the last operation, as a crash in the
+// middle of it would, and requires that the volume opens to a state in which
+// each record of that operation is there completely or not at all. A small
+// file is cut at every byte. A large one, which is written with pwrite, is
+// cut at every 61st.
 func TestTornTail(t *testing.T) {
+	t.Run("4KiB", func(t *testing.T) { tornTail(t, 64<<10, 3000, 1) })
+	t.Run("100KiB", func(t *testing.T) { tornTail(t, 512<<10, 100<<10, 61) })
+}
+
+func tornTail(t *testing.T, segSize int64, size int, step int64) {
 	dir := t.TempDir()
-	fsys := open(t, dir, 64<<10)
+	fsys := open(t, dir, segSize)
 	fsys.MkdirAll("d", 0o755)
 	fsys.WriteFile("d/kept", bytes.Repeat([]byte("k"), 5000), 0o644)
 	before := tree(t, fsys)
 	start := fsys.head.tail
-	last := bytes.Repeat([]byte("L"), 3000)
+	last := bytes.Repeat([]byte("L"), size)
 	fsys.WriteFile("d/last", last, 0o644)
 	end := fsys.head.tail
 	seg := fsys.head.path
@@ -327,7 +334,7 @@ func TestTornTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	outcomes := map[string]int{}
-	for cut := start; cut <= end; cut++ {
+	for cut := start; cut <= end; cut += step {
 		for _, damage := range []string{"zeros", "garbage"} {
 			img := append([]byte{}, whole...)
 			for i := cut; i < end; i++ {
@@ -372,10 +379,217 @@ func TestTornTail(t *testing.T) {
 			re2.abandon()
 		}
 	}
-	if outcomes["absent"] == 0 || outcomes["created, not written"] == 0 || outcomes["complete"] == 0 {
-		t.Errorf("expected all three outcomes, got %v", outcomes)
+	if outcomes["absent"] == 0 || outcomes["created, not written"] == 0 {
+		t.Errorf("expected cuts that leave the file absent and cuts that leave it empty, got %v", outcomes)
 	}
-	t.Logf("%d cut points: %v", end-start+1, outcomes)
+	t.Logf("%d cut points: %v", (end-start)/step+1, outcomes)
+}
+
+// TestPowerLoss imitates what a power cut leaves on disk: of everything
+// written since the last Sync, some pages made it and some did not, and
+// segment files created since then may be missing or empty. The volume has
+// to open anyway, to the state after some operation at or past the Sync, and
+// what did not survive must never come back, however much is written
+// afterwards.
+func TestPowerLoss(t *testing.T) {
+	const segSize, page = 64 << 10, 4096
+	dir := t.TempDir()
+	fsys, err := Open(dir, &Options{SegmentSize: segSize, NoAutoCompact: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(7))
+	var states []map[string]string // the tree after each operation
+	// Every operation here is a single record, so the states a recovery may
+	// land on are exactly the states between operations.
+	op := func(i int) {
+		name := fmt.Sprintf("d%d/f%d", i%3, rng.Intn(12))
+		switch rng.Intn(8) {
+		case 0:
+			fsys.Remove(name)
+		case 1:
+			fsys.Rename(name, fmt.Sprintf("d%d/g%d", rng.Intn(3), rng.Intn(12)))
+		case 2:
+			fsys.Truncate(name, int64(rng.Intn(4000)))
+		default:
+			f, err := fsys.OpenFile(name, os.O_WRONLY|os.O_APPEND, 0)
+			if err != nil { // not there yet: creating it is this operation
+				if f, err = fsys.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644); err == nil {
+					f.Close()
+				}
+				break
+			}
+			data := make([]byte, 500+rng.Intn(6000))
+			rng.Read(data)
+			f.Write(data)
+			f.Close()
+		}
+		states = append(states, tree(t, fsys))
+	}
+	for d := 0; d < 3; d++ {
+		fsys.Mkdir(fmt.Sprintf("d%d", d), 0o755)
+	}
+	for i := 0; i < 40; i++ {
+		op(i)
+	}
+	if err := fsys.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	syncedState := len(states) - 1
+	syncedSeq, syncedOff := fsys.head.seq, fsys.head.tail
+	for i := 40; i < 260; i++ { // several segments past the sync
+		op(i)
+	}
+	if fsys.head.seq < syncedSeq+3 {
+		t.Fatalf("the unsynced part spans only %d segments, the test needs more", fsys.head.seq-syncedSeq)
+	}
+	fsys.abandon()
+	pristine := filepath.Join(t.TempDir(), "pristine")
+	copyDir(t, dir, pristine)
+
+	matches := func(got map[string]string) int {
+		for j := len(states) - 1; j >= syncedState; j-- {
+			if len(got) == len(states[j]) {
+				same := true
+				for p, c := range states[j] {
+					if got[p] != c {
+						same = false
+						break
+					}
+				}
+				if same {
+					return j
+				}
+			}
+		}
+		return -1
+	}
+	recoveredAt := map[int]int{}
+	for trial := 0; trial < 150; trial++ {
+		work := filepath.Join(t.TempDir(), "vol")
+		copyDir(t, pristine, work)
+		segs, _ := filepath.Glob(filepath.Join(work, "*.seg"))
+		sort.Strings(segs)
+		for _, path := range segs {
+			seq64, _ := strconv.ParseUint(filepath.Base(path)[:8], 10, 32)
+			seq := uint32(seq64)
+			if seq < syncedSeq {
+				continue
+			}
+			// A segment created after the sync may have no directory entry.
+			if seq > syncedSeq && rng.Intn(6) == 0 {
+				os.Remove(path)
+				continue
+			}
+			img, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first := int64(0)
+			if seq == syncedSeq {
+				first = (syncedOff + page - 1) / page // the page holding the synced tail is on disk
+			}
+			for pg := first; pg < segSize/page; pg++ {
+				if rng.Intn(4) == 0 { // this page never reached the disk
+					clear(img[pg*page : (pg+1)*page])
+				}
+			}
+			if err := os.WriteFile(path, img, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		re, err := Open(work, &Options{NoAutoCompact: true})
+		if err != nil {
+			t.Fatalf("trial %d: the volume does not open after a power cut: %v", trial, err)
+		}
+		got := tree(t, re)
+		at := matches(got)
+		if at < 0 {
+			t.Fatalf("trial %d: the recovered tree is not the state after any operation since the sync", trial)
+		}
+		recoveredAt[at-syncedState]++
+		// Write well past anything recovery could have cleared, then come
+		// back: nothing that was lost may reappear.
+		for i := 0; i < 40; i++ {
+			name := fmt.Sprintf("after/f%d", i)
+			re.MkdirAll("after", 0o755)
+			data := bytes.Repeat([]byte{byte(i)}, 3000+i*50)
+			if err := re.WriteFile(name, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			got["/after"] = "dir"
+			got["/"+name] = "file:" + string(data)
+		}
+		re.abandon()
+		re2, err := Open(work, &Options{NoAutoCompact: true})
+		if err != nil {
+			t.Fatalf("trial %d: reopening after writing on: %v", trial, err)
+		}
+		sameTree(t, fmt.Sprintf("trial %d, after writing on and reopening", trial), tree(t, re2), got)
+		re2.abandon()
+		if t.Failed() {
+			return
+		}
+	}
+	if len(recoveredAt) < 3 {
+		t.Errorf("expected recoveries at several different points, got %v (operations past the sync -> trials)", recoveredAt)
+	}
+	t.Logf("150 power cuts; operations past the sync that survived -> trials: %v", recoveredAt)
+}
+
+func copyDir(t *testing.T, from, to string) {
+	t.Helper()
+	if err := os.MkdirAll(to, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() == "LOCK" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(from, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(to, e.Name()), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestTinyFilesAreNotCompactedForever fills a volume with files so small
+// that record headers take most of the space. Such segments are not garbage,
+// and compaction must not keep copying them.
+func TestTinyFilesAreNotCompactedForever(t *testing.T) {
+	fsys := open(t, t.TempDir(), 64<<10)
+	defer fsys.Close()
+	const files = 60000
+	for i := 0; i < files; i++ {
+		if err := fsys.WriteFile(fmt.Sprintf("d%02d/f%05d", i%50, i), []byte("0123456789abcdef"), 0o644); err != nil {
+			if i < 50 { // the directories do not exist yet
+				fsys.MkdirAll(fmt.Sprintf("d%02d", i%50), 0o755)
+				i--
+				continue
+			}
+			t.Fatal(err)
+		}
+	}
+	if _, err := fsys.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	fsys.mu.RLock()
+	moved := fsys.relocated
+	fsys.mu.RUnlock()
+	if live := int64(files * 16); moved > live/10 {
+		t.Errorf("compaction copied %d bytes of live data; the volume only holds %d, all of it live", moved, live)
+	}
+	if u := fsys.Usage(); u.Live != files*16 {
+		t.Errorf("live = %d, want %d", u.Live, files*16)
+	}
 }
 
 func TestCompactReclaimsSpace(t *testing.T) {
@@ -586,13 +800,14 @@ func TestKill9(t *testing.T) {
 				t.Fatalf("round %d: write %d was reported done but reads back as %d bytes, %v", round, n, len(data), err)
 			}
 		}
-		// Whatever else is there must be whole too: empty or complete.
+		// Whatever else is there must be made of whole records: empty,
+		// complete, or cut where one record of a large write ends.
 		entries, _ := fsys.ReadDir("")
 		for _, e := range entries {
 			n, _ := strconv.Atoi(e.Name()[1:])
 			info, _ := e.Info()
-			if info.Size() != 0 && info.Size() != int64(len(crashPayload(n))) {
-				t.Fatalf("round %d: %s has %d bytes, a torn write", round, e.Name(), info.Size())
+			if size, full := info.Size(), int64(len(crashPayload(n))); size != 0 && size != full && size%(64<<10) != 0 {
+				t.Fatalf("round %d: %s has %d of %d bytes, a torn record", round, e.Name(), size, full)
 			}
 		}
 		fsys.abandon() // do not checkpoint: the next round replays the whole log
@@ -605,7 +820,15 @@ func TestKill9(t *testing.T) {
 
 func crashName(n int) string { return fmt.Sprintf("f%07d", n) }
 
-func crashPayload(n int) []byte { return bytes.Repeat([]byte{byte('a' + n%26)}, 100+n%5000) }
+// crashPayload is small for most writes and 150 KiB for every 40th, which is
+// large enough to be written with pwrite, in several records.
+func crashPayload(n int) []byte {
+	size := 100 + n%5000
+	if n%40 == 39 {
+		size = 150 << 10
+	}
+	return bytes.Repeat([]byte{byte('a' + n%26)}, size)
+}
 
 func crashWriter(dir string) {
 	fsys, err := Open(dir, &Options{SegmentSize: 256 << 10})

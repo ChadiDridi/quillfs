@@ -51,7 +51,8 @@ type segment struct {
 	f    *os.File
 	mem  []byte
 	tail int64 // next free byte; only meaningful for the head segment
-	live int64 // bytes of file data that some extent still points to
+	data int64 // bytes of file data ever written into it
+	live int64 // how many of those some extent still points to
 }
 
 func segName(seq uint32) string { return fmt.Sprintf("%08d.seg", seq) }
@@ -97,6 +98,7 @@ func (fsys *FS) newSegment() error {
 	fsys.segs[seq] = seg
 	fsys.head = seg
 	fsys.nextSeq++
+	fsys.dirDirty.Store(true) // the new name is not on disk until the directory is synced
 	if fsys.wake != nil && fsys.garbageHeavy() {
 		select {
 		case fsys.wake <- struct{}{}:
@@ -157,10 +159,11 @@ func (fsys *FS) writeRecord(seg *segment, typ byte, meta, data []byte) int64 {
 		h[8] = typ
 		binary.LittleEndian.PutUint32(h[12:], uint32(len(meta)))
 		binary.LittleEndian.PutUint32(h, crc32.Update(crc32.Checksum(h[4:], castagnoli), castagnoli, data))
-		if _, err := unix.Pwritev(int(seg.f.Fd()), [][]byte{h, data}, pos); err == nil {
+		if written, err := unix.Pwritev(int(seg.f.Fd()), [][]byte{h, data}, pos); err == nil && written == n {
 			return pos
 		}
-		// Fall through and store it the other way.
+		// An error or a short write: store the record the other way, which
+		// overwrites whatever part of it got through.
 	}
 	b := seg.mem[pos : pos+int64(n)]
 	binary.LittleEndian.PutUint32(b[4:], uint32(n))

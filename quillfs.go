@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -57,8 +58,11 @@ type FS struct {
 	hdr      []byte // reused for the header of a record written with pwrite
 	closed   bool
 
-	syncMu sync.Mutex // serializes Sync and Compact
-	synced logPos     // everything before this is on stable storage
+	syncMu   sync.Mutex  // serializes Sync and Compact
+	synced   logPos      // everything before this is on stable storage
+	dirDirty atomic.Bool // a segment file was created since the directory was last synced
+
+	relocated int64 // bytes of file data moved by compaction, for tests
 
 	wake chan struct{} // tells the maintenance goroutine to compact
 	stop chan struct{}
@@ -117,17 +121,27 @@ func (fsys *FS) maintain(stop, wake <-chan struct{}) {
 	}
 }
 
-// garbageHeavy reports whether more than half of a volume of at least four
-// segments is dead. The caller holds mu.
+// reclaimable reports whether compacting would free most of a segment: all
+// of its file data is dead, or more than half is. What counts is the data
+// that was written into it, not its size, so a segment full of tiny live
+// files is not garbage just because headers take most of its bytes.
+func (fsys *FS) reclaimable(s *segment) bool {
+	return s != fsys.head && s.live*2 < s.data || s != fsys.head && s.live == 0
+}
+
+// garbageHeavy reports whether more than half of the segments of a volume of
+// at least four are reclaimable. The caller holds mu.
 func (fsys *FS) garbageHeavy() bool {
 	if len(fsys.segs) < 4 {
 		return false
 	}
-	var live int64
+	n := 0
 	for _, s := range fsys.segs {
-		live += s.live
+		if fsys.reclaimable(s) {
+			n++
+		}
 	}
-	return live*2 < int64(len(fsys.segs))*fsys.segSize
+	return n*2 > len(fsys.segs)
 }
 
 // stopMaintenance ends the background goroutine and waits for it. It must be
@@ -204,6 +218,14 @@ func (fsys *FS) Sync() error {
 func (fsys *FS) flush(dirty []*segment, upTo logPos) error {
 	for _, s := range dirty {
 		if err := syscall.Fdatasync(int(s.f.Fd())); err != nil {
+			return err
+		}
+	}
+	// A segment is only as durable as its name. Without this, a power cut
+	// could leave synced records in a file the directory does not list.
+	if fsys.dirDirty.Swap(false) {
+		if err := syncDir(fsys.dir); err != nil {
+			fsys.dirDirty.Store(true)
 			return err
 		}
 	}
