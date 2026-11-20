@@ -23,7 +23,7 @@ jobs:
       - name: Test
         run: go test -race -count=1 ./...
       - name: Crash tests, repeated
-        run: go test -run 'TestKill9|TestTornTail|TestAgainstRealFileSystem' -count=5 .
+        run: go test -run 'TestKill9|TestPowerLoss|TestAgainstRealFileSystem' -count=5 .
 
   benchmark:
     name: benchmark against the kernel file systems of this runner

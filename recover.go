@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 const (
@@ -137,14 +138,25 @@ func (fsys *FS) load(opts *Options) error {
 		if closed && i+1 < len(seqs) && seqs[i+1] == seq+1 && !blank[seq+1] {
 			continue // the log goes on in the next segment
 		}
+		// Anything recovery throws away has to stay thrown away. If this
+		// cleanup were only in memory, a second power cut could bring the
+		// discarded records back underneath newer ones.
+		cleaned := false
 		for _, later := range seqs[i+1:] {
 			fsys.segs[later].close()
 			os.Remove(fsys.segs[later].path)
 			delete(fsys.segs, later)
+			cleaned = true
 		}
 		fsys.nextSeq = seq + 1
 		if closed {
-			return fsys.newSegment()
+			if err := fsys.newSegment(); err != nil {
+				return err
+			}
+			if cleaned {
+				return syncDir(fsys.dir)
+			}
+			return nil
 		}
 		// Whatever follows the last good record must never be read as a
 		// record: not the write that was cut short, and not older records
@@ -154,8 +166,15 @@ func (fsys *FS) load(opts *Options) error {
 			n := min(len(rest), len(zero))
 			if !bytes.Equal(rest[:n], zero[:n]) {
 				clear(rest[:n])
+				cleaned = true
 			}
 			rest = rest[n:]
+		}
+		if cleaned {
+			if err := syscall.Fdatasync(int(seg.f.Fd())); err != nil {
+				return err
+			}
+			return syncDir(fsys.dir)
 		}
 		return nil
 	}

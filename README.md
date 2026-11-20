@@ -7,8 +7,9 @@ That is the whole trick, and it cuts both ways. Measured against ext4 on the sam
 | | |
 |---|---|
 | **Faster, single-threaded** | Small files: create 3.4× to 19×, read 4.4× to 8.3×, append 4.1× to 16×, overwrite in place 2.4× to 11×. Metadata: `stat` 5.6× to 11×, delete 18× to 44×, truncate 12× to 42×, rename 29× to 88×, rename a directory 26× to 72×. The same holds against tmpfs, xfs, btrfs and f2fs. |
-| **Slower than ext4** | Create-and-delete churn once reclaiming the space is counted (0.7×). Calling fsync from eight goroutines at once (0.4× to 0.6×). |
-| **Depends on the machine** | Eight goroutines creating and reading at once: 0.8× to 5.4×. There is one writer lock, so quillfs does not scale with cores; whether that loses depends on how well the kernel file system does. Also one fsync per file (0.6× to 0.9×), and writing (0.9× to 1.0×) and reading (0.7× to 0.8×) one large file. |
+| **About the same** | Writing one large file and syncing it (0.9× to 1.0×). |
+| **Slower than ext4** | Reading one large file (0.7× to 0.8×). One fsync per file (0.6× to 0.9×), and fsync from eight goroutines at once (0.4× to 0.6×). Create-and-delete churn once reclaiming the space is counted (0.7×). |
+| **Depends on the machine** | Eight goroutines creating and reading at once: 0.8× to 5.4×. There is one writer lock, so quillfs does not scale with cores; whether that loses depends on how fast the kernel file system is on that machine. |
 | **What you give up** | It cannot be mounted, and other programs cannot see the files. One process owns a volume at a time. The whole tree is held in memory, about 244 bytes per file. No hard links, no symbolic links, and permission bits are stored but not enforced. |
 
 So quillfs is not a replacement for ext4. It is for a program that keeps a great many small files to itself — a cache, a build system's object store, a message spool, a test fixture tree — and spends its time in metadata and small reads and writes.
@@ -50,7 +51,7 @@ quillfs gives the guarantees you get from a kernel file system without calling f
 - **A record is there completely or not at all.** Every record carries a checksum, written last, and recovery stops in front of the first record that fails it. One record is one `Mkdir`, `Remove`, `Rename` or `Truncate`, or one write of up to 4 MiB. So a rename is atomic, however large the directory.
 - **Calls made of several records can be cut between them**, as their `os` counterparts can be cut between system calls: `WriteFile` (create, then write) can leave an empty file, a write larger than 4 MiB can stop at a 4 MiB boundary, and `MkdirAll` and `RemoveAll` can stop part of the way.
 - **`Sync` is fsync.** After it returns, everything written before it survives a power cut. Calls made at the same time share one flush.
-- **After a power cut**, of what was written since the last `Sync` some may be on disk and some not. Recovery keeps the longest prefix of the log that is intact and discards the rest, so the volume opens to the state after some operation at or past the last `Sync`.
+- **After a power cut**, of what was written since the last `Sync` some may be on disk and some not. Recovery keeps the longest prefix of the log that is intact and discards the rest, so the volume opens to the state after some operation at or past the last `Sync`. The discarding is itself synced before `Open` returns.
 
 ## How it works
 
@@ -62,7 +63,7 @@ The **tree** — directories, names, sizes, and for each file where its bytes ar
 - **Space** comes back by **compaction**: segments that are mostly dead have their live data copied to the head of the log and are deleted. A background goroutine does it when more than half of the volume is garbage.
 - **Disk space** for a segment is reserved before the segment is mapped, so that running out of disk comes back as an error from the call that needed the segment, not as a signal on a store into the mapping. No test covers this path.
 
-The file system is about 1,800 lines of Go.
+The file system is about 1,900 lines of Go.
 
 ## Benchmark
 
@@ -92,9 +93,9 @@ Laptop (Intel i7-1355U, NVMe, Linux 6.8), measured at commit `56ce417`. 12 CPUs,
 Reading it:
 
 - **tmpfs** never touches a disk, so it is about as fast as a kernel file system gets. quillfs is still ahead of it on single-threaded small-file and metadata work, because what it saves is the system call, not the disk.
-- **One lock serializes all writers.** On the laptop, eight goroutines get less done on quillfs than on ext4. On the runner below, where system calls cost more, quillfs is ahead even so. It does not scale with cores either way.
+- **One lock serializes all writers.** On the laptop, eight goroutines get less done on quillfs than on ext4. On the runner below, where ext4 itself runs at about half the speed, quillfs is ahead even so. It does not scale with cores either way.
 - **Reclaiming space costs.** It means copying live data and flushing a checkpoint, which ext4 does not need.
-- **Large files and fsync are the disk's business.** Those rows move from run to run and from machine to machine, and quillfs has no advantage there.
+- **Large files and fsync are the disk's business.** quillfs has no advantage there: it writes a large file about as fast as ext4 and reads it slower, and each fsync costs it a little more. On the laptop these rows also moved a good deal between full runs.
 - Run it on yours:
 
 ```sh
@@ -141,7 +142,7 @@ Opening is fast either way: a checkpoint is one sequential read, and replaying t
 - **Against a real file system.** The same random operations — write, overwrite, append, truncate, rename, remove, mkdir — run on a volume and on a real directory, and every result has to match: the same error, the same bytes read back, the same tree at the end. Along the way the volume is closed and reopened, dropped without closing, and compacted.
 - **`kill -9`.** A writer process is killed with SIGKILL at a random moment, six times in a row. Every write it reported as done must be there afterwards, complete.
 - **Torn writes.** The log is cut inside an operation, at every byte for a small file and at every 61st for a 100 KiB one, with zeros and with garbage after the cut. The volume must open with every record whole or absent, and must stay usable.
-- **Power cuts.** 150 times over, a random quarter of the pages written since the last `Sync` are wiped and new segment files are removed. The volume must open to the state after some operation at or past the `Sync`, and nothing that was lost may reappear after more is written.
+- **Power cuts, imitated.** 150 times over, a random quarter of the pages written since the last `Sync` are wiped and new segment files are removed. The volume must open to the state after some operation at or past the `Sync`, and nothing that was lost may reappear after more is written. This is a simulation on files; no machine was actually powered off.
 - **Recovery equals memory.** Eight goroutines hammer a volume while it compacts; replaying the log must give back exactly the tree that was in memory.
 - **Space.** Rewriting the same files sixty times must not grow the volume, and a volume of tiny files must not be compacted over and over.
 - **`testing/fstest.TestFS`** on the `io/fs` view, and the race detector on everything.
