@@ -2,14 +2,13 @@
 
 **A file system that lives inside your process.** A quillfs volume is a directory tree with files you create, append to, overwrite, truncate, rename and delete, but no part of it is in the kernel: your Go program links the package and calls it directly. The data sits in memory-mapped log segments, the tree sits in memory, and a read, a `stat` or a small write involves no system call at all.
 
-That is the whole trick, and it cuts both ways. Measured against ext4 on the same disk, through the same Go process ([numbers below](#benchmark)):
+That is the whole trick, and it cuts both ways. Measured against ext4 on the same disk, through the same Go process, on a laptop and on a CI runner (each range is those two machines; [numbers below](#benchmark)):
 
 | | |
 |---|---|
-| **Faster, single-threaded** | Small files: create 3.4×, read 4.4×, append 4.1×, overwrite in place 2.4×. Metadata: `stat` 5.6×, delete 18×, truncate 12×, rename 29×, rename a directory 26×. |
-| **About the same** | Creating a file and calling fsync on each one (0.9×). The disk decides that, not the file system. |
-| **Slower** | Eight goroutines creating and reading at once (0.8×): there is one writer lock. Create-and-delete churn once reclaiming the space is counted (0.7×). |
-| **Varies from run to run** | Writing and reading one large file, and fsync from eight goroutines at once. Across several full runs on the same laptop these came out above ext4, below it and level with it, so no claim is made either way. |
+| **Faster, single-threaded** | Small files: create 3.4× to 19×, read 4.4× to 8.3×, append 4.1× to 16×, overwrite in place 2.4× to 11×. Metadata: `stat` 5.6× to 11×, delete 18× to 44×, truncate 12× to 42×, rename 29× to 88×, rename a directory 26× to 72×. The same holds against tmpfs, xfs, btrfs and f2fs. |
+| **Slower than ext4** | Create-and-delete churn once reclaiming the space is counted (0.7×). Calling fsync from eight goroutines at once (0.4× to 0.6×). |
+| **Depends on the machine** | Eight goroutines creating and reading at once: 0.8× to 5.4×. There is one writer lock, so quillfs does not scale with cores; whether that loses depends on how well the kernel file system does. Also one fsync per file (0.6× to 0.9×), and writing (0.9× to 1.0×) and reading (0.7× to 0.8×) one large file. |
 | **What you give up** | It cannot be mounted, and other programs cannot see the files. One process owns a volume at a time. The whole tree is held in memory, about 244 bytes per file. No hard links, no symbolic links, and permission bits are stored but not enforced. |
 
 So quillfs is not a replacement for ext4. It is for a program that keeps a great many small files to itself — a cache, a build system's object store, a message spool, a test fixture tree — and spends its time in metadata and small reads and writes.
@@ -93,15 +92,35 @@ Laptop (Intel i7-1355U, NVMe, Linux 6.8), measured at commit `56ce417`. 12 CPUs,
 Reading it:
 
 - **tmpfs** never touches a disk, so it is about as fast as a kernel file system gets. quillfs is still ahead of it on single-threaded small-file and metadata work, because what it saves is the system call, not the disk.
-- **The losses are real.** One lock serializes all writers, so with eight goroutines the kernel file systems are ahead. Reclaiming space means copying live data and flushing a checkpoint, which ext4 does not need.
-- **Three rows are not stable** on this machine: the large-file write, the large-file read, and fsync from eight goroutines came out on either side of ext4 from one full run to the next. Treat them as a tie.
-- Numbers from one machine. Run it on yours:
+- **One lock serializes all writers.** On the laptop, eight goroutines get less done on quillfs than on ext4. On the runner below, where system calls cost more, quillfs is ahead even so. It does not scale with cores either way.
+- **Reclaiming space costs.** It means copying live data and flushing a checkpoint, which ext4 does not need.
+- **Large files and fsync are the disk's business.** Those rows move from run to run and from machine to machine, and quillfs has no advantage there.
+- Run it on yours:
 
 ```sh
 go run github.com/ChadiDridi/quillfs/cmd/quillbench@latest -dirs /path/on/your/disk,/dev/shm
 ```
 
-<!-- ci-benchmark -->
+GitHub-hosted runner (Linux 7.0), measured at commit `a7a7cff` by the [benchmark job](.github/workflows/ci.yml), which runs on every push and prints its own numbers. 4 CPUs, go1.27.4, 20000 files, large file 128 MiB, median of 3 runs. Each column is quillfs on that file system divided by that file system; xfs, btrfs and f2fs are loop devices on the runner's disk.
+
+| Workload | ext4 | tmpfs | xfs | btrfs | f2fs |
+|---|---:|---:|---:|---:|---:|
+| create 4 KiB files | **19×** | **3.5×** | **20×** | **6.8×** | **3.8×** |
+| stat | **11×** | **9.6×** | **11×** | **11×** | **11×** |
+| read whole files | **8.3×** | **7.2×** | **8.3×** | **8.3×** | **7.1×** |
+| overwrite 1 KiB inside a file | **11×** | **7.1×** | **13×** | **42×** | **4.5×** |
+| append 1 KiB | **16×** | **10×** | **20×** | **12×** | **6.6×** |
+| truncate to 2 KiB | **42×** | **24×** | **354×** | **47×** | **31×** |
+| list directories | **2.5×** | **2.3×** | 1.0× | **1.5×** | **1.2×** |
+| rename a file | **88×** | **20×** | **41×** | **106×** | **25×** |
+| rename a directory of files | **72×** | **27×** | **51×** | **109×** | **32×** |
+| delete | **44×** | **22×** | **156×** | **112×** | **43×** |
+| create + read, 8 goroutines | **5.4×** | **1.3×** | **7.1×** | **6.0×** | **1.8×** |
+| create + delete, space reclaimed | 0.7× | **3.3×** | **1.2×** | **1.7×** | 0.7× |
+| create 4 KiB + fsync each | 0.6× | **4.7×** | 0.9× | **3.2×** | **1.3×** |
+| create 4 KiB + fsync each, 8 goroutines | 0.4× | **1.4×** | 0.8× | 0.9× | 0.5× |
+| write a large file, then fsync | 1.0× | 0.8× | **1.3×** | 0.8× | 1.0× |
+| read a large file | 0.7× | 0.7× | 0.7× | 0.5× | 0.7× |
 
 ### A million files
 
