@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Format and vet
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+      - name: Test
+        run: go test -race -count=1 ./...
+      - name: Crash tests, repeated
+        run: go test -run 'TestKill9|TestTornTail|TestAgainstRealFileSystem' -count=5 .
+
+  benchmark:
+    name: benchmark against the kernel file systems of this runner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Prepare file systems
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xfsprogs btrfs-progs f2fs-tools >/dev/null
+          dirs=/mnt/bench-ext4,/dev/shm
+          sudo mkdir -p /mnt/bench-ext4 && sudo chown "$USER" /mnt/bench-ext4
+          for fs in xfs btrfs f2fs; do
+            img=/mnt/$fs.img
+            sudo truncate -s 6G $img
+            case $fs in
+              xfs) sudo mkfs.xfs -q $img ;;
+              btrfs) sudo mkfs.btrfs -q $img ;;
+              f2fs) sudo mkfs.f2fs -q $img ;;
+            esac
+            sudo mkdir -p /mnt/bench-$fs
+            # Not every kernel ships every file system; test the ones it has.
+            if sudo mount -o loop $img /mnt/bench-$fs 2>/dev/null; then
+              sudo chown "$USER" /mnt/bench-$fs
+              dirs=$dirs,/mnt/bench-$fs
+            else
+              echo "this kernel cannot mount $fs, skipping it"
+            fi
+          done
+          echo "DIRS=$dirs" >> "$GITHUB_ENV"
+          uname -r
+      - name: Run
+        run: |
+          go build -o /tmp/quillbench ./cmd/quillbench
+          { echo "kernel $(uname -r)"; /tmp/quillbench -runs 3 -large 128 -dirs "$DIRS"; } 2>&1 | tee /tmp/bench.txt
+          { echo '```'; cat /tmp/bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
